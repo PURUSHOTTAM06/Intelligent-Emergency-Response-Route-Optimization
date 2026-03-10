@@ -15,7 +15,7 @@ import { Activity, ShieldAlert, Navigation, Cpu, Zap, Globe, Database, Map as Ma
 //
 // Vite exposes `VITE_` variables under `import.meta.env`.  A sensible local
 // fallback is `http://localhost:5000` so the UI still works outside Codespaces.
-const BASE_URL = import.meta.env.VITE_BASE_URL || "http://localhost:5000";
+const BASE_URL = "https://opulent-system-5gxxpqvjrw9vfppwv-5000.app.github.dev";// Use the IP instead of 'localhost'
 
 const App = () => {
   const [route, setRoute] = useState(null);

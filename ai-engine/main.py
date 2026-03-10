@@ -5,74 +5,55 @@ from pydantic import BaseModel
 from model import DQNBrain
 from environment import UrbanGraphEnv
 
-app = FastAPI(title="Emergency_AI_DQN_Inference_Engine")
+app = FastAPI()
 
-# --- HYPERPARAMETERS & CONFIG ---
-STATE_DIM = 21  # [Current_Pos(1) + Traffic(10) + Incidents(10)]
-ACTION_DIM = 10 
+STATE_DIM, ACTION_DIM = 21, 25
 MODEL_PATH = "ambulance_dqn_v1.pth"
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cpu")
 
-# --- LOAD NEURAL BRAIN ---
-# We initialize the architecture and load the trained weights
 brain = DQNBrain(STATE_DIM, ACTION_DIM).to(DEVICE)
 try:
     brain.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-    brain.eval() # Set to evaluation mode (disables dropout/batchnorm)
-    print(f"✅ AI Brain Loaded Successfully from {MODEL_PATH}")
-except FileNotFoundError:
-    print(f"❌ ERROR: {MODEL_PATH} not found. Run train_main.py first!")
+    brain.eval()
+    print("✅ [NEURAL_LINK_ESTABLISHED]")
+except:
+    print("❌ Model Not Found - Please Retrain")
 
 class DispatchRequest(BaseModel):
     x: int
     y: int
 
-@app.get("/")
-def health_check():
-    return {
-        "status": "ONLINE",
-        "engine": "DEEP_Q_NETWORK_V1",
-        "device": str(DEVICE)
-    }
-
 @app.post("/get-optimal-route")
 async def get_route(request: DispatchRequest):
-    env = UrbanGraphEnv(num_nodes=10)
-    state = env.reset() # In production, this state would pull from real-time traffic data
+    env = UrbanGraphEnv(size=5)
+    env.current_pos = (max(0, min(request.x, 4)), max(0, min(request.y, 4)))
+    state = env.get_state()
     
-    path = []
-    current_node = 0  # Assuming dispatch starts at node 0
-    hospital_node = 9 # Destination node
-    max_steps = 15    # Safety cutoff
-    
-    # Inference Loop: Neural Network predicts each step
+    path = [[env.current_pos[0], env.current_pos[1]]]
+    visited = {env.node_to_id[env.current_pos]} # Loop prevention
+
     with torch.no_grad():
-        for _ in range(max_steps):
-            # Convert state to tensor for the Brain
+        for _ in range(15): # Max steps for a 5x5 grid
             state_t = torch.FloatTensor(state).unsqueeze(0).to(DEVICE)
+            q_values = brain(state_t)
             
-            # Brain predicts Q-values; we take the argmax (best action)
-            action = brain(state_t).argmax().item()
+            # --- MASKING & LOOP PREVENTION ---
+            mask = torch.full((1, 25), -1e9).to(DEVICE)
+            neighbors = list(env.G.neighbors(env.current_pos))
+            for n in neighbors:
+                n_id = env.node_to_id[n]
+                # Apply penalty to nodes already in the current path
+                penalty = -200.0 if n_id in visited else 0.0
+                mask[0, n_id] = penalty
             
-            # Map action back to grid coordinates for your React UI
-            # (Example mapping: Node ID converted to X,Y)
-            path.append([action // 2, action % 2])
-            
-            if action == hospital_node:
-                break
-            
-            # Move environment forward to the next state
+            action = (q_values + mask).argmax().item()
             state, _, done = env.step(action)
+            
+            visited.add(action)
+            path.append([action // 5, action % 5])
             if done: break
 
-    return {
-        "status": "SUCCESS",
-        "optimal_path": path,
-        "telemetry": {
-            "model_version": "1.0.0-DQN",
-            "compute_device": str(DEVICE)
-        }
-    }
+    return {"status": "SUCCESS", "optimal_path": path}
 
 if __name__ == "__main__":
     import uvicorn
