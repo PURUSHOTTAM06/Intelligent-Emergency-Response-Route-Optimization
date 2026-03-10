@@ -1,75 +1,74 @@
-import numpy as np
+import torch
+import torch.optim as optim
+import torch.nn as nn
 import random
-import pickle
-from environment import EmergencyEnv
+import numpy as np
+from model import DQNBrain
+from memory import ReplayMemory
 
-class QLearningAgent:
-    def __init__(self, env, learning_rate=0.1, discount_factor=0.9, epsilon=1.0):
-        self.env = env
-        self.lr = learning_rate
-        self.gamma = discount_factor # Importance of future rewards
-        self.epsilon = epsilon       # Exploration rate (start by being random)
-        self.epsilon_decay = 0.995   # Get smarter over time
+class DQNAgent:
+    def __init__(self, state_dim, action_dim):
+        # Hardware acceleration check
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.action_dim = action_dim
         
-        # Initialize Q-Table with zeros
-        # State: (x, y) coordinates | Actions: Up, Down, Left, Right
-        self.q_table = {}
+        # Policy Net: The active network that the ambulance uses to decide moves
+        self.policy_net = DQNBrain(state_dim, action_dim).to(self.device)
+        # Target Net: A stable 'goal' network to prevent the AI from chasing its own tail
+        self.target_net = DQNBrain(state_dim, action_dim).to(self.device)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=1e-3)
+        self.memory = ReplayMemory(capacity=10000)
+        self.gamma = 0.99 
+        self.batch_size = 64
 
-    def get_q_value(self, state, action):
-        return self.q_table.get((state, action), 0.0)
+    def choose_action(self, state, epsilon):
+        """Exploration vs Exploitation: Uses Epsilon to decide between random or smart moves"""
+        if random.random() < epsilon:
+            return random.randrange(self.action_dim)
+        
+        with torch.no_grad():
+            # Convert state to tensor and push to GPU/CPU
+            state_t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            return self.policy_net(state_t).argmax().item()
 
-    def choose_action(self, state):
-        """Epsilon-Greedy: Sometimes explore, sometimes use the Cheat Sheet"""
-        neighbors = list(self.env.G.neighbors(state))
-        
-        if random.uniform(0, 1) < self.epsilon:
-            return random.choice(neighbors) # Explore randomly
-        else:
-            # Look at the Q-table and pick the best road
-            q_values = [self.get_q_value(state, a) for a in neighbors]
-            max_q = max(q_values)
-            # Handle multiple roads with the same best score
-            best_actions = [a for i, a in enumerate(neighbors) if q_values[i] == max_q]
-            return random.choice(best_actions)
+    def learn(self):
+        """The core Deep Learning update using the Bellman Equation"""
+        if len(self.memory) < self.batch_size:
+            return None
 
-    def learn(self, state, action, reward, next_state):
-        """Update the Cheat Sheet using the Q-Learning Formula"""
-        old_value = self.get_q_value(state, action)
-        
-        # What is the best we can do from the next intersection?
-        next_neighbors = list(self.env.G.neighbors(next_state))
-        next_max = max([self.get_q_value(next_state, a) for a in next_neighbors]) if next_neighbors else 0
-        
-        # The core Q-Learning Formula (Bellman Equation)
-        new_value = old_value + self.lr * (reward + self.gamma * next_max - old_value)
-        self.q_table[(state, action)] = new_value
+        # 1. Sample a random batch of past experiences (Matrix Math starts here)
+        transitions = self.memory.sample(self.batch_size)
+        batch = list(zip(*transitions))
 
-# --- TRAINING LOOP ---
-if __name__ == "__main__":
-    env = EmergencyEnv()
-    agent = QLearningAgent(env)
-    
-    print("🚀 Training the Ambulance AI...")
-    for episode in range(500): # Run the simulation 500 times
-        state = env.reset()
-        done = False
-        total_reward = 0
-        
-        while not done:
-            action = agent.choose_action(state)
-            next_state, reward, done = env.step(action)
-            agent.learn(state, action, reward, next_state)
-            state = next_state
-            total_reward += reward
-        
-        # Decay epsilon: Explore less as we learn more
-        agent.epsilon *= agent.epsilon_decay
-        
-        if (episode + 1) % 100 == 0:
-            print(f"Episode {episode + 1}: Total Penalty: {total_reward:.2f}")
+        state_batch = torch.FloatTensor(np.array(batch[0])).to(self.device)
+        action_batch = torch.LongTensor(batch[1]).unsqueeze(1).to(self.device)
+        reward_batch = torch.FloatTensor(batch[2]).to(self.device)
+        next_state_batch = torch.FloatTensor(np.array(batch[3])).to(self.device)
+        done_batch = torch.FloatTensor(batch[4]).to(self.device)
 
-    print("✅ Training Complete!")
-    # Save the Q-table to a file
-    with open("ambulance_brain.pkl", "wb") as f:
-        pickle.dump(agent.q_table, f)
-    print("💾 AI Brain saved as ambulance_brain.pkl")
+        # 2. Predict Q-values for current states
+        current_q_values = self.policy_net(state_batch).gather(1, action_batch)
+
+        # 3. Calculate 'Ideal' Q-values using the Target Network
+        with torch.no_grad():
+            max_next_q_values = self.target_net(next_state_batch).max(1)[0]
+            # Bellman formula: Target = Reward + Gamma * Max_Future_Reward
+            target_q_values = reward_batch + (self.gamma * max_next_q_values * (1 - done_batch))
+
+        # 4. Compute Loss (MSE) - how far off was the ambulance's guess?
+        loss = nn.MSELoss()(current_q_values.squeeze(), target_q_values)
+
+        # 5. Backpropagation: Optimize the Neural Network weights
+        self.optimizer.zero_grad()
+        loss.backward()
+        # Gradient clipping to prevent 'Exploding Gradients' common in RL
+        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
+        self.optimizer.step()
+
+        return loss.item()
+
+    def update_target_network(self):
+        """Syncs the stable network with the active network"""
+        self.target_net.load_state_dict(self.policy_net.state_dict())
