@@ -1,74 +1,71 @@
 import torch
 import torch.optim as optim
 import torch.nn as nn
-import random
 import numpy as np
-from model import DQNBrain
-from memory import ReplayMemory
+import random
+from model import JaipurNeuralEngine # Importing your Dueling DQN
 
-class DQNAgent:
-    def __init__(self, state_dim, action_dim):
-        # Hardware acceleration check
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+class AmbulanceAgent:
+    def __init__(self, state_dim, action_dim, lr=1e-4, gamma=0.99):
         self.action_dim = action_dim
+        self.gamma = gamma # Discount factor: how much we value future speed
         
-        # Policy Net: The active network that the ambulance uses to decide moves
-        self.policy_net = DQNBrain(state_dim, action_dim).to(self.device)
-        # Target Net: A stable 'goal' network to prevent the AI from chasing its own tail
-        self.target_net = DQNBrain(state_dim, action_dim).to(self.device)
+        # 1. Two Networks for Stability (Production Standard)
+        self.policy_net = JaipurNeuralEngine(state_dim, action_dim)
+        self.target_net = JaipurNeuralEngine(state_dim, action_dim)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=1e-3)
-        self.memory = ReplayMemory(capacity=10000)
-        self.gamma = 0.99 
-        self.batch_size = 64
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
+        self.criterion = nn.MSELoss()
+        
+        # 2. Epsilon-Greedy Parameters
+        self.epsilon = 1.0 # Start with 100% exploration
+        self.epsilon_min = 0.05
+        self.epsilon_decay = 0.995
 
-    def choose_action(self, state, epsilon):
-        """Exploration vs Exploitation: Uses Epsilon to decide between random or smart moves"""
-        if random.random() < epsilon:
-            return random.randrange(self.action_dim)
+    def select_action(self, state):
+        """
+        Exploration vs. Exploitation Trade-off.
+        """
+        if random.random() < self.epsilon:
+            return random.randrange(self.action_dim) # Explore: Take a random road
         
         with torch.no_grad():
-            # Convert state to tensor and push to GPU/CPU
-            state_t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-            return self.policy_net(state_t).argmax().item()
+            state_t = torch.FloatTensor(state).unsqueeze(0)
+            q_values = self.policy_net(state_t)
+            return q_values.argmax().item() # Exploit: Take the AI's best road
 
-    def learn(self):
-        """The core Deep Learning update using the Bellman Equation"""
-        if len(self.memory) < self.batch_size:
-            return None
+    def learn(self, memory, batch_size):
+        """
+        The Optimization Loop.
+        """
+        if len(memory) < batch_size:
+            return
 
-        # 1. Sample a random batch of past experiences (Matrix Math starts here)
-        transitions = self.memory.sample(self.batch_size)
-        batch = list(zip(*transitions))
+        # 1. Sample from Experience Replay
+        states, actions, rewards, next_states, dones = memory.sample(batch_size)
 
-        state_batch = torch.FloatTensor(np.array(batch[0])).to(self.device)
-        action_batch = torch.LongTensor(batch[1]).unsqueeze(1).to(self.device)
-        reward_batch = torch.FloatTensor(batch[2]).to(self.device)
-        next_state_batch = torch.FloatTensor(np.array(batch[3])).to(self.device)
-        done_batch = torch.FloatTensor(batch[4]).to(self.device)
+        # 2. Get Current Q-Values
+        current_q = self.policy_net(states).gather(1, actions.unsqueeze(1))
 
-        # 2. Predict Q-values for current states
-        current_q_values = self.policy_net(state_batch).gather(1, action_batch)
-
-        # 3. Calculate 'Ideal' Q-values using the Target Network
+        # 3. Get Target Q-Values (Double DQN Logic)
         with torch.no_grad():
-            max_next_q_values = self.target_net(next_state_batch).max(1)[0]
-            # Bellman formula: Target = Reward + Gamma * Max_Future_Reward
-            target_q_values = reward_batch + (self.gamma * max_next_q_values * (1 - done_batch))
+            next_q = self.target_net(next_states).max(1)[0]
+            target_q = rewards + (self.gamma * next_q * (~dones))
 
-        # 4. Compute Loss (MSE) - how far off was the ambulance's guess?
-        loss = nn.MSELoss()(current_q_values.squeeze(), target_q_values)
-
-        # 5. Backpropagation: Optimize the Neural Network weights
+        # 4. Backpropagation
+        loss = self.criterion(current_q.squeeze(), target_q)
         self.optimizer.zero_grad()
         loss.backward()
-        # Gradient clipping to prevent 'Exploding Gradients' common in RL
+        
+        # Clip Gradients (Production Trick: Prevents the model from 'exploding')
         torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
         self.optimizer.step()
 
-        return loss.item()
+        # 5. Decay Exploration
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
 
     def update_target_network(self):
-        """Syncs the stable network with the active network"""
+        """Synchronizes the target net with the policy net."""
         self.target_net.load_state_dict(self.policy_net.state_dict())

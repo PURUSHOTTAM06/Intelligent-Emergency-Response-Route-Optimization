@@ -2,81 +2,151 @@ require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
-const mongoose = require('mongoose');
-const Dispatch = require('./db');
 
 const app = express();
 
-// --- CRITICAL FIX 1: LOOSEN CORS FOR CODESPACES ---
-// This allows your browser (port 5173) to talk to this server (port 5000)
-app.use(cors({
-    origin: '*', 
-    methods: ['GET', 'POST'],
-    allowedHeaders: ['Content-Type']
-}));
-
+app.use(cors({ origin: '*', methods: ['GET', 'POST'] }));
 app.use(express.json());
 
-// --- DATABASE CONNECTION ---
-mongoose.connect(process.env.MONGODB_URI)
-    .then(() => console.log("✅ Database Link Established: Atlas_Cloud_Sync_Active"))
-    .catch(err => console.error("❌ DB Connection Error:", err));
+const PORT = 5000;
+const AI_URL = "http://localhost:8000";
 
-// --- DIAGNOSTICS ENDPOINT ---
-app.get('/', (req, res) => {
-    res.json({ 
-        status: "ONLINE", 
-        service: "Emergency_Orchestrator_v1",
-        database: mongoose.connection.readyState === 1 ? "CONNECTED" : "DISCONNECTED"
-    });
+/**
+ * CITY REGISTRY 4.0 - PRODUCTION DATASET
+ * Includes Jaipur, Delhi, Allahabad, and Bangalore.
+ */
+const CITY_REGISTRY = {
+    "jaipur": {
+        id: "jaipur",
+        name: "Jaipur",
+        center: [26.9124, 75.7873],
+        query: "Jaipur, Rajasthan, India",
+        targets: {
+            hospitals: [
+                { name: "SMS Medical Center", lat: 26.8917, lng: 75.8153 },
+                { name: "Fortis International", lat: 26.8488, lng: 75.8038 },
+                { name: "Santokba Durlabhji", lat: 26.8982, lng: 75.8065 }
+            ],
+            schools: [
+                { name: "MGD Girls School", lat: 26.9105, lng: 75.8122 },
+                { name: "St. Xavier's Senior Sec", lat: 26.9168, lng: 75.7981 }
+            ],
+            offices: [
+                { name: "World Trade Park (WTP)", lat: 26.8524, lng: 75.8051 },
+                { name: "Genpact IT Park", lat: 26.8242, lng: 75.8135 }
+            ]
+        }
+    },
+    "delhi": {
+        id: "delhi",
+        name: "Delhi",
+        center: [28.6139, 77.2090],
+        query: "New Delhi, Delhi, India",
+        targets: {
+            hospitals: [
+                { name: "AIIMS Delhi", lat: 28.5672, lng: 77.2100 },
+                { name: "Safdarjung Hospital", lat: 28.5665, lng: 77.2075 }
+            ],
+            schools: [
+                { name: "Delhi Public School (RK Puram)", lat: 28.5639, lng: 77.1725 },
+                { name: "Modern School Barakhamba", lat: 28.6315, lng: 77.2345 }
+            ],
+            offices: [
+                { name: "Cyber City (Gurugram)", lat: 28.4950, lng: 77.0878 },
+                { name: "Connaught Place Hub", lat: 28.6304, lng: 77.2177 }
+            ]
+        }
+    },
+    "allahabad": {
+        id: "allahabad",
+        name: "Allahabad",
+        center: [25.4358, 81.8463],
+        query: "Prayagraj, Uttar Pradesh, India",
+        targets: {
+            hospitals: [
+                { name: "Nazareth Hospital", lat: 25.4412, lng: 81.8520 },
+                { name: "SRN Hospital", lat: 25.4325, lng: 81.8339 }
+            ],
+            schools: [
+                { name: "Boys' High School (BHS)", lat: 25.4542, lng: 81.8335 },
+                { name: "St. Joseph's College", lat: 25.4515, lng: 81.8350 }
+            ],
+            offices: [
+                { name: "Civil Lines Business District", lat: 25.4485, lng: 81.8322 },
+                { name: "High Court Complex", lat: 25.4580, lng: 81.8250 }
+            ]
+        }
+    },
+    "bangalore": {
+        id: "bangalore",
+        name: "Bangalore",
+        center: [12.9716, 77.5946],
+        query: "Bengaluru, Karnataka, India",
+        targets: {
+            hospitals: [
+                { name: "Manipal Hospital Old Airport Rd", lat: 12.9593, lng: 77.6444 },
+                { name: "St. John's Medical College", lat: 12.9344, lng: 77.6120 }
+            ],
+            schools: [
+                { name: "Bishop Cotton Boys", lat: 12.9678, lng: 77.5985 },
+                { name: "The Valley School", lat: 12.8625, lng: 77.5180 }
+            ],
+            offices: [
+                { name: "Manyata Tech Park", lat: 13.0451, lng: 77.6266 },
+                { name: "Bagmane World Tech Park", lat: 12.9805, lng: 77.6936 }
+            ]
+        }
+    }
+};
+
+app.get('/api/cities', (req, res) => {
+    const list = Object.values(CITY_REGISTRY);
+    console.log(`📡 HUD_SYNC: Synchronizing ${list.length} sectors.`);
+    res.json(list);
 });
 
-// --- MAIN NEURAL DISPATCH ROUTE ---
-app.post('/api/dispatch', async (req, res) => {
-    const { x, y } = req.body;
-    console.log(`📡 Dispatch Request Received: Initializing AI Route from (${x}, ${y})`);
+app.post('/dispatch', async (req, res) => {
+    const { cityId, user_lat, user_lng, target_lat, target_lng } = req.body;
+    
+    const city = CITY_REGISTRY[cityId?.toLowerCase()];
+    if (!city) return res.status(400).json({ error: "INVALID_SECTOR" });
+
+    if (!target_lat || !target_lng) {
+        return res.status(400).json({ error: "NO_TARGET_COORDINATES" });
+    }
 
     try {
-        // --- CRITICAL FIX 2: ALIGN WITH DQN FASTAPI ---
-        // Your Python engine now uses POST /get-optimal-route
-        // Use the Public Port 8000 URL from your .env
-        const aiResponse = await axios.post(`${process.env.PYTHON_AI_URL}/get-optimal-route`, {
-            x: Number(x),
-            y: Number(y)
-        });
-
-        const optimalPath = aiResponse.data.optimal_path;
-
-        // --- DATABASE PERSISTENCE ---
-        const newDispatch = new Dispatch({
-            start_node: { x: Number(x), y: Number(y) },
-            hospital_node: { x: 4, y: 4 }, // Fixed destination for our JPR grid
-            optimal_path: optimalPath,
-            status: "OPTIMIZED_BY_DQN"
-        });
+        console.log(`🧠 AI_INVOCATION: Requesting path optimization for ${city.name}...`);
         
-        await newDispatch.save();
-        console.log(`💾 Telemetry Logged to Atlas: ID ${newDispatch._id}`);
+        // Added a 15-second timeout to handle large graph calculations in Python
+        const aiResponse = await axios.post(`${AI_URL}/get_route`, {
+            city_query: city.query,
+            start_lat: parseFloat(user_lat),
+            start_lng: parseFloat(user_lng),
+            end_lat: parseFloat(target_lat),
+            end_lng: parseFloat(target_lng)
+        }, { timeout: 15000 });
 
-        // Send results back to React HUD
         res.json({
-            status: "SUCCESS",
-            path: optimalPath,
-            db_id: newDispatch._id,
-            meta: aiResponse.data.telemetry
+            status: "success",
+            city: city.name,
+            route: aiResponse.data.route,
+            telemetry: aiResponse.data.telemetry
         });
 
-    } catch (error) {
-        console.error("🚨 Neural Link Error:", error.response?.data || error.message);
-        res.status(500).json({ 
-            error: "NEURAL_LINK_FAILURE",
-            details: "Ensure Python engine is running on Port 8000 and set to PUBLIC."
+    } catch (err) {
+        const errorMsg = err.response?.data || err.message;
+        console.error("❌ AI_ENGINE_LINK_FAILURE:", errorMsg);
+        res.status(503).json({ 
+            status: "error", 
+            message: "Neural Engine Timeout. Ensure Python backend is running on port 8000." 
         });
     }
 });
 
-const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-    console.log(`🚀 Orchestrator active on Port ${PORT}`);
-    console.log(`🔗 Target AI Engine: ${process.env.PYTHON_AI_URL}`);
+    console.log(`\n-----------------------------------------`);
+    console.log(`🚀 ORCHESTRATOR ONLINE | http://localhost:${PORT}`);
+    console.log(`🏙️  REGISTRY: ${Object.keys(CITY_REGISTRY).join(', ').toUpperCase()}`);
+    console.log(`-----------------------------------------\n`);
 });

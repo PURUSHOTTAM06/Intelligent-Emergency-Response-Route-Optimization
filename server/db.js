@@ -1,9 +1,8 @@
 const mongoose = require('mongoose');
 
-// This schema tracks every emergency dispatch for history and analysis
 const DispatchSchema = new mongoose.Schema({
-    start_node: { x: Number, y: Number },
-    hospital_node: { x: Number, y: Number },
+    start_node: { lat: Number, lng: Number },
+    hospital_node: { lat: Number, lng: Number },
     optimal_path: Array,
     travel_time_penalty: Number,
     timestamp: { type: Date, default: Date.now }
