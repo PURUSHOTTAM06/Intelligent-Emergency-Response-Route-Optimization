@@ -11,14 +11,10 @@ class MultiCityTrafficEnv:
         self.city_id = city_id
         print(f"📡 INITIALIZING_ENV: Loading {city_id.upper()} Sector Map...")
         
-        # 1. --- THE GEOSPATIAL BRIDGE FIX ---
-        # Load the raw graph (The one we downloaded in Meters/UTM)
+        # 1. --- THE GEOSPATIAL BRIDGE ---
         raw_G = ox.load_graphml(graph_path)
-        
-        # Keep a Lat/Lng version for Frontend Snap (React speaks this)
+        # Lat/Lng for Frontend, Projected for AI Math
         self.G = ox.project_graph(raw_G, to_crs="EPSG:4326")
-        
-        # Keep a Projected version for AI Math (DQN & A* speak this)
         self.G_proj = raw_G 
         
         self.nodes = list(self.G_proj.nodes())
@@ -37,6 +33,7 @@ class MultiCityTrafficEnv:
                 self.centrality = pickle.load(f)
         else:
             print(f"🧠 ANALYZING_TOPOLOGY: Calculating {city_id} (First time only)...")
+            # Using a sample of nodes (k=50) for speed, weighting by road length
             self.centrality = nx.betweenness_centrality(
                 nx.Graph(self.G_proj), 
                 k=min(len(self.nodes), 50), 
@@ -45,13 +42,21 @@ class MultiCityTrafficEnv:
             )
             with open(cache_file, 'wb') as f:
                 pickle.dump(self.centrality, f)
-            print(f"✅ CACHE_CREATED: {cache_file}")
         
         self.current_time = datetime.datetime.now()
         self.state_dim = 6 
         
-    def _get_temporal_features(self):
-        hour = self.current_time.hour + self.current_time.minute / 60.0
+    def _get_temporal_features(self, target_hour=None):
+        """
+        Calculates sin/cos features for the hour.
+        If target_hour is provided, it uses that instead of current time.
+        """
+        if target_hour is not None:
+            hour = float(target_hour)
+        else:
+            hour = self.current_time.hour + self.current_time.minute / 60.0
+            
+        # Standard trigonometric encoding for circular time
         h_sin = math.sin(2 * math.pi * hour / 24)
         h_cos = math.cos(2 * math.pi * hour / 24)
         return h_sin, h_cos
@@ -64,8 +69,8 @@ class MultiCityTrafficEnv:
         if isinstance(h_type, list): h_type = h_type[0]
         return mapping.get(h_type, 0.1)
 
-    def get_feature_matrix(self):
-        h_sin, h_cos = self._get_temporal_features()
+    def get_feature_matrix(self, target_hour=None):
+        h_sin, h_cos = self._get_temporal_features(target_hour)
         feature_dict = {}
 
         for u, v, k, data in self.edges:
@@ -89,17 +94,29 @@ class MultiCityTrafficEnv:
             
         return feature_dict
 
-    def simulate_traffic_step(self):
-        h_sin, _ = self._get_temporal_features()
-        base_congestion = max(1.0, (h_sin * 2.5) + np.random.normal(0, 0.2))
+    def simulate_traffic_step(self, target_hour=None):
+        """
+        Updates 'ai_weight' based on the Diurnal Traffic Curve.
+        """
+        h_sin, _ = self._get_temporal_features(target_hour)
         
+        # CIVIL ENGINEERING LOGIC: 
+        # Base congestion peaks during daytime (sin wave)
+        # We add a small random normal noise to simulate unpredictable incidents
+        base_congestion = max(1.1, (abs(h_sin) * 3.0) + np.random.normal(0, 0.1))
+        
+        
+
         for u, v, k, data in self.edges:
             lanes_raw = data.get('lanes', 1)
             if isinstance(lanes_raw, list): lanes_raw = lanes_raw[0]
             lanes = int(lanes_raw) if str(lanes_raw).isdigit() else 1
             
+            # Bottlenecks (high centrality) are 15x more likely to clog during peak
             centrality_impact = self.centrality.get(u, 0) * 15
-            # Cost = Time impact
+            
+            # Final AI Weight calculation: 
+            # Multiplier increases with congestion and centrality, decreases with lanes.
             data['ai_weight'] = (data['length'] * base_congestion * (1 + centrality_impact)) / lanes
 
         return self.G_proj

@@ -1,238 +1,265 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { MapContainer, TileLayer, Marker, Polyline, useMap, useMapEvents, Popup } from 'react-leaflet';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { MapContainer, TileLayer, Marker, Polyline, useMap, useMapEvents } from 'react-leaflet';
 import axios from 'axios';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import './App.css';
 
-// --- PROFESSIONAL ASSETS ---
+// --- ASSETS ---
 const getIcon = (color) => new L.Icon({
     iconUrl: `https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-${color}.png`,
     shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/0.7.7/images/marker-shadow.png',
-    iconSize: [25, 41], iconAnchor: [12, 41], popupAnchor: [1, -34], shadowSize: [41, 41]
+    iconSize: [22, 35], iconAnchor: [11, 35]
 });
 
-const icons = {
-    user: getIcon('blue'),
-    hospitals: getIcon('red'),
-    schools: getIcon('gold'),
-    offices: getIcon('violet')
-};
+const icons = { user: getIcon('blue'), hospitals: getIcon('red'), schools: getIcon('gold'), offices: getIcon('violet'), police: getIcon('gray') };
 
-// --- EMERGENCY VEHICLE SPEEDS (km/h) ---
 const VEHICLE_PROFILES = {
-    ambulance: { name: 'Ambulance', speed: 50, icon: '🚑' },
-    police: { name: 'Police', speed: 65, icon: '🚓' },
-    fire: { name: 'Fire Engine', speed: 35, icon: '🚒' }
+    als_ambulance: { name: 'ALS Ambulance', baseSpeed: 55, icon: '🚑' },
+    police_rapid: { name: 'Police Interceptor', baseSpeed: 70, icon: '🚓' }
 };
 
-// --- CINEMATIC MAP ANIMATOR ---
-function MapAnimate({ center, cityId }) {
+function MapEventsHandler({ onMapClick, activeCity }) {
     const map = useMap();
-    const prevCityId = useRef();
+    const lastCityId = useRef(activeCity?.id);
 
     useEffect(() => {
-        if (center && cityId !== prevCityId.current) {
-            map.flyTo(center, 13, {
-                animate: true,
-                duration: 2.5,
-                easeLinearity: 0.25
-            });
-            prevCityId.current = cityId;
+        if (activeCity && activeCity.id !== lastCityId.current) {
+            map.zoomOut(1, { animate: true });
+            setTimeout(() => {
+                map.flyTo(activeCity.center, 12, { animate: true, duration: 1.8 });
+            }, 300);
+            lastCityId.current = activeCity.id;
         }
-    }, [center, cityId, map]);
+        map.invalidateSize();
+    }, [activeCity, map]);
+
+    useMapEvents({ click(e) { onMapClick(e.latlng); } });
     return null;
 }
 
 function App() {
+    const [targetHour, setTargetHour] = useState(parseInt(localStorage.getItem('saved_hour')) || 12);
+    const [uiHour, setUiHour] = useState(targetHour); // UI state for zero-lag slider
+    
+    const [userLocation, setUserLocation] = useState(JSON.parse(localStorage.getItem('user_loc')) || null);
+    const savedPos = JSON.parse(localStorage.getItem('map_pos')) || { lat: 26.91, lng: 75.78 };
+    const savedZoom = parseInt(localStorage.getItem('map_zoom')) || 12;
+
     const [cities, setCities] = useState([]);
     const [activeCity, setActiveCity] = useState(null);
     const [category, setCategory] = useState('hospitals');
-    const [vehicle, setVehicle] = useState('ambulance'); // New Vehicle State
-    const [userLocation, setUserLocation] = useState(null);
+    const [selectedVehicle, setSelectedVehicle] = useState('als_ambulance');
+    const [currentTarget, setCurrentTarget] = useState(null); 
     const [route, setRoute] = useState([]);
-    const [isLoading, setIsLoading] = useState(false);
     const [telemetry, setTelemetry] = useState(null);
+    const [isLoading, setIsLoading] = useState(false);
+    
+    const [isGreenCorridor, setIsGreenCorridor] = useState(false);
+    const [isPoliceSync, setIsPoliceSync] = useState(false);
+    const [isForecast, setIsForecast] = useState(false);
 
+    const theme = useMemo(() => {
+        const h = uiHour;
+        if (h >= 5 && h < 10) return { color: '#f59e0b', label: 'MORNING PEAK' };
+        if (h >= 16 && h < 20) return { color: '#ea580c', label: 'EVENING RUSH' };
+        return { color: '#2563eb', label: 'OPTIMAL FLOW' };
+    }, [uiHour]);
+
+    // FETCH CITY DATA (Updates Wait Times when Time changes)
     useEffect(() => {
-        const fetchCities = async () => {
-            try {
-                const res = await axios.get('http://localhost:5000/api/cities');
-                setCities(res.data);
-                if (res.data.length > 0) setActiveCity(res.data[0]);
-            } catch (err) { console.error("ORCHESTRATOR_OFFLINE"); }
-        };
-        fetchCities();
-    }, []);
-
-    const MapClickHandler = () => {
-        useMapEvents({
-            click(e) {
-                setUserLocation(e.latlng);
-                setRoute([]);
-            },
+        axios.get(`http://localhost:5000/api/cities?hour=${targetHour}`).then(res => {
+            setCities(res.data);
+            const savedId = localStorage.getItem('active_city_id') || 'jaipur';
+            setActiveCity(res.data.find(c => c.id === savedId) || res.data[0]);
         });
-        return null;
-    };
+    }, [targetHour]);
 
-    const handleDispatch = async (target) => {
+    // DYNAMIC HOSPITAL SORTING
+    const sortedNodes = useMemo(() => {
+        if (!activeCity?.targets?.[category]) return [];
+        let list = [...activeCity.targets[category]];
+        
+        if (category === 'hospitals' && userLocation) {
+            const isPeak = (targetHour >= 8 && targetHour <= 11) || (targetHour >= 17 && targetHour <= 21);
+            const speed = isGreenCorridor ? 75 : (isPeak ? 15 : VEHICLE_PROFILES[selectedVehicle].baseSpeed);
+            
+            return list.sort((a, b) => {
+                const distA = L.latLng(userLocation).distanceTo([a.lat, a.lng]) / 1000;
+                const distB = L.latLng(userLocation).distanceTo([b.lat, b.lng]) / 1000;
+                const scoreA = (distA / speed * 60) + (a.waitTime || 0);
+                const scoreB = (distB / speed * 60) + (b.waitTime || 0);
+                return scoreA - scoreB;
+            });
+        }
+        return list;
+    }, [activeCity, category, userLocation, targetHour, selectedVehicle, isGreenCorridor]);
+
+    // THE AI DISPATCH TRIGGER
+    const triggerDispatch = useCallback(async (node, hour, corridor, sync, forecast) => {
         if (!userLocation || !activeCity) return;
         setIsLoading(true);
         try {
             const res = await axios.post('http://localhost:5000/dispatch', {
-                cityId: activeCity.id,
-                user_lat: userLocation.lat,
-                user_lng: userLocation.lng,
-                target_lat: target.lat,
-                target_lng: target.lng
+                cityId: activeCity.id, user_lat: userLocation.lat, user_lng: userLocation.lng,
+                target_lat: node.lat, target_lng: node.lng, target_hour: hour,
+                isGreenCorridor: corridor, isPoliceSync: sync, isForecast: forecast
             });
-            setRoute(res.data.route);
-            setTelemetry(res.data.telemetry);
-        } catch (err) { alert("AI_ENGINE_TIMEOUT: Check Python backend."); }
+            if (res.data.route) {
+                // STITCHING: Forcing the path to perfectly touch the User Marker and Target Marker
+                const stitchedRoute = [
+                    { lat: userLocation.lat, lng: userLocation.lng },
+                    ...res.data.route,
+                    { lat: node.lat, lng: node.lng }
+                ];
+                setRoute(stitchedRoute);
+                setTelemetry(res.data.telemetry);
+                setCurrentTarget(node);
+            }
+        } catch (e) { console.error("Mission Sync Error"); }
         setIsLoading(false);
+    }, [activeCity, userLocation]);
+
+    // AUTO-REROUTE WHEN CONDITIONS CHANGE
+    useEffect(() => {
+        if (currentTarget) triggerDispatch(currentTarget, targetHour, isGreenCorridor, isPoliceSync, isForecast);
+    }, [targetHour, isGreenCorridor, isPoliceSync, isForecast]);
+
+    const handleCityChange = (id) => {
+        const city = cities.find(c => c.id === id);
+        setActiveCity(city);
+        localStorage.setItem('active_city_id', id);
+        setRoute([]); setTelemetry(null); setCurrentTarget(null);
     };
 
-    // Calculate Dynamic ETA based on selected vehicle
-    const getETA = () => {
-        if (!telemetry) return 0;
-        const distanceKm = telemetry.distance_m / 1000;
-        const speedKmH = VEHICLE_PROFILES[vehicle].speed;
-        const hours = distanceKm / speedKmH;
-        return Math.ceil(hours * 60); // Convert to minutes
+    const handleMapClick = (latlng) => {
+        setUserLocation(latlng);
+        localStorage.setItem('user_loc', JSON.stringify(latlng));
+        setRoute([]); setTelemetry(null); setCurrentTarget(null);
     };
+
+    if (!activeCity) return null;
 
     return (
-        <div style={{ display: 'flex', height: '100vh', width: '100vw', overflow: 'hidden' }}>
-            {/* CLEAN PROFESSIONAL SIDEBAR */}
-            <aside style={{ width: '420px', backgroundColor: 'white', zIndex: 1000, display: 'flex', flexDirection: 'column' }} className="shadow-soft">
-                <header style={{ padding: '28px 24px', borderBottom: '1px solid var(--slate-100)' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
-                        <div style={{ width: '36px', height: '36px', background: 'var(--primary)', borderRadius: '8px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white', fontWeight: 800, fontSize: '18px' }}>R</div>
-                        <div>
-                            <h1 style={{ margin: 0, fontSize: '1.1rem', fontWeight: 700, letterSpacing: '-0.3px', color: 'var(--slate-900)' }}>RouteFlow Intelligence</h1>
-                            <div style={{ fontSize: '0.7rem', color: 'var(--slate-600)', fontWeight: 500, display: 'flex', alignItems: 'center', gap: '5px' }}>
-                                <span style={{ width: '6px', height: '6px', background: 'var(--success)', borderRadius: '50%' }}></span>
-                                SYSTEM_STATUS: OPERATIONAL
-                            </div>
-                        </div>
+        <div className="main-layout">
+            <aside className="sidebar">
+                <header className="sidebar-header">
+                    <div className="logo-box" style={{ background: theme.color }}>R</div>
+                    <div className="title-stack">
+                        <h1 className="main-title">RouteFlow Command</h1>
+                        <span className="status-tag">SYSTEM_{isLoading ? 'SYNC' : 'READY'}</span>
                     </div>
                 </header>
 
-                <div style={{ padding: '24px', flex: 1, overflowY: 'auto' }}>
-                    {/* SECTOR & CATEGORY */}
-                    <section style={{ marginBottom: '24px' }}>
-                        <div style={{ display: 'flex', gap: '10px' }}>
-                            <div style={{ flex: 1 }}>
-                                <label style={{ fontSize: '0.70rem', fontWeight: 700, color: 'var(--slate-600)', textTransform: 'uppercase' }}>Sector</label>
-                                <select 
-                                    onChange={(e) => { setActiveCity(cities.find(c => c.id === e.target.value)); setRoute([]); }}
-                                    style={{ width: '100%', marginTop: '6px', padding: '10px', borderRadius: '8px', border: '1px solid var(--slate-200)', backgroundColor: 'var(--slate-50)', fontSize: '0.85rem', outline: 'none' }}
-                                >
-                                    {cities.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-                                </select>
-                            </div>
-                            <div style={{ flex: 1 }}>
-                                <label style={{ fontSize: '0.70rem', fontWeight: 700, color: 'var(--slate-600)', textTransform: 'uppercase' }}>Unit Type</label>
-                                <select 
-                                    value={vehicle}
-                                    onChange={(e) => setVehicle(e.target.value)}
-                                    style={{ width: '100%', marginTop: '6px', padding: '10px', borderRadius: '8px', border: '1px solid var(--slate-200)', backgroundColor: 'var(--slate-50)', fontSize: '0.85rem', outline: 'none' }}
-                                >
-                                    {Object.entries(VEHICLE_PROFILES).map(([key, data]) => (
-                                        <option key={key} value={key}>{data.icon} {data.name}</option>
-                                    ))}
-                                </select>
-                            </div>
+                <div className="sidebar-scrollable">
+                    <div className="input-grid">
+                        <div className="input-group">
+                            <label>Sector</label>
+                            <select value={activeCity.id} onChange={(e) => handleCityChange(e.target.value)}>
+                                {cities.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                            </select>
                         </div>
-                    </section>
+                        <div className="input-group">
+                            <label>Unit</label>
+                            <select value={selectedVehicle} onChange={(e) => setSelectedVehicle(e.target.value)}>
+                                {Object.entries(VEHICLE_PROFILES).map(([k,v]) => <option key={k} value={k}>{v.icon} {v.name}</option>)}
+                            </select>
+                        </div>
+                    </div>
 
-                    <nav style={{ display: 'flex', background: 'var(--slate-100)', padding: '4px', borderRadius: '10px', marginBottom: '28px' }}>
+                    <div className="mode-selector-grid">
+                        <button className={`mode-btn ${isGreenCorridor ? 'active-corridor' : ''}`} onClick={() => setIsGreenCorridor(!isGreenCorridor)}>CORRIDOR</button>
+                        <button className={`mode-btn ${isPoliceSync ? 'active-police' : ''}`} onClick={() => setIsPoliceSync(!isPoliceSync)}>POLICE</button>
+                        <button className={`mode-btn ${isForecast ? 'active-forecast' : ''}`} onClick={() => setIsForecast(!isForecast)}>FORECAST</button>
+                    </div>
+
+                    <div className="time-slider-card">
+                        <div className="slider-header" style={{ color: theme.color }}>
+                            <span>{theme.label}</span>
+                            <span className="time-display">{uiHour}:00</span>
+                        </div>
+                        {/* DEBOUNCED SLIDER: Instant UI feedback, API call only on MouseUp */}
+                        <input type="range" min="0" max="23" value={uiHour} className="custom-range" 
+                               onChange={(e) => setUiHour(parseInt(e.target.value))} 
+                               onMouseUp={() => { setTargetHour(uiHour); localStorage.setItem('saved_hour', uiHour); }}
+                               onTouchEnd={() => { setTargetHour(uiHour); localStorage.setItem('saved_hour', uiHour); }}
+                               style={{ '--accent': theme.color }} />
+                    </div>
+
+                    <nav className="category-nav">
                         {['hospitals', 'schools', 'offices'].map(type => (
-                            <button 
-                                key={type} onClick={() => { setCategory(type); setRoute([]); }}
-                                style={{ 
-                                    flex: 1, padding: '10px 0', borderRadius: '7px', fontSize: '0.75rem', cursor: 'pointer', border: 'none', transition: '0.2s',
-                                    backgroundColor: category === type ? 'white' : 'transparent', color: category === type ? 'var(--primary)' : 'var(--slate-600)',
-                                    fontWeight: 600, boxShadow: category === type ? '0 2px 4px rgba(0,0,0,0.05)' : 'none'
-                                }}
-                            >
-                                {type.charAt(0).toUpperCase() + type.slice(1)}
-                            </button>
+                            <button key={type} onClick={() => setCategory(type)} className={category === type ? 'active' : ''}>{type.toUpperCase()}</button>
                         ))}
                     </nav>
 
-                    <div style={{ borderTop: '1px solid var(--slate-100)', paddingTop: '24px' }}>
-                        <h3 style={{ fontSize: '0.85rem', fontWeight: 700, color: 'var(--slate-900)', marginBottom: '16px' }}>Available Destinations</h3>
-                        {!userLocation && (
-                            <div style={{ padding: '20px', textAlign: 'center', backgroundColor: 'var(--slate-50)', borderRadius: '12px', border: '1px dashed var(--slate-200)' }}>
-                                <p style={{ fontSize: '0.8rem', color: 'var(--slate-600)', margin: 0 }}>📍 Mark your current position on the map to begin routing.</p>
-                            </div>
-                        )}
-                        
-                        {activeCity?.targets[category].map((dest, i) => (
-                            <div key={i} className="destination-card" style={{ padding: '16px', border: '1px solid var(--slate-200)', borderRadius: '12px', marginBottom: '12px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                                <div style={{ overflow: 'hidden' }}>
-                                    <div style={{ fontWeight: 600, fontSize: '0.9rem', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }}>{dest.name}</div>
-                                    <div style={{ fontSize: '0.75rem', color: 'var(--slate-600)', marginTop: '2px' }}>AI Routing Available</div>
+                    <div className="nodes-container">
+                        {sortedNodes.map((dest) => {
+                            const isLocked = currentTarget?.name === dest.name;
+                            return (
+                                <div key={dest.name} className={`node-card ${isLocked ? 'active-mission' : ''}`}>
+                                    <div className="node-info">
+                                        <h3 className="node-name">{dest.name}</h3>
+                                        <p className="node-meta">
+                                            {category === 'hospitals' ? (
+                                                <><span className="wait-tag">⏱️ {dest.waitTime}m wait</span> | <span className="bed-tag">🛏️ {dest.beds} beds</span></>
+                                            ) : 'Ready'}
+                                        </p>
+                                    </div>
+                                    <button 
+                                        className={`dispatch-btn ${isLocked ? 'locked' : 'route'}`} 
+                                        onClick={() => triggerDispatch(dest, targetHour, isGreenCorridor, isPoliceSync, isForecast)}
+                                        style={!isLocked ? { background: theme.color } : {}}
+                                    >
+                                        {isLocked ? 'LOCKED' : 'ROUTE'}
+                                    </button>
                                 </div>
-                                <button 
-                                    disabled={!userLocation || isLoading} onClick={() => handleDispatch(dest)}
-                                    className="btn-primary" 
-                                    style={{ padding: '8px 16px', fontSize: '0.8rem', borderRadius: '8px', fontWeight: 600, backgroundColor: '#8b5cf6' }} // Purple Button
-                                >
-                                    {isLoading ? "..." : "Route"}
-                                </button>
-                            </div>
-                        ))}
+                            );
+                        })}
                     </div>
                 </div>
 
-                {telemetry && (
-                    <footer style={{ padding: '24px', background: 'var(--slate-900)', color: 'white' }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                            <div>
-                                <div style={{ fontSize: '0.65rem', color: 'var(--slate-600)', fontWeight: 700, textTransform: 'uppercase' }}>Total Distance</div>
-                                <div style={{ fontSize: '1.2rem', fontWeight: 700 }}>{(telemetry.distance_m / 1000).toFixed(2)} <span style={{ fontSize: '0.8rem', fontWeight: 400 }}>km</span></div>
-                            </div>
-                            <div style={{ width: '1px', height: '30px', backgroundColor: 'var(--slate-700)' }}></div>
-                            <div style={{ textAlign: 'right' }}>
-                                <div style={{ fontSize: '0.65rem', color: 'var(--slate-600)', fontWeight: 700, textTransform: 'uppercase' }}>{VEHICLE_PROFILES[vehicle].icon} Est. Time ({vehicle})</div>
-                                <div style={{ fontSize: '1.2rem', fontWeight: 700, color: '#a78bfa' }}>{getETA()} <span style={{ fontSize: '0.8rem', fontWeight: 400 }}>min</span></div>
-                            </div>
-                        </div>
-                    </footer>
-                )}
+                <footer className={`telemetry-box ${telemetry && currentTarget ? 'pop-in' : 'pop-out'}`}>
+                    <div className="tele-row">
+                        <div className="tele-item"><label className="label-tiny">SPATIAL</label><span className="val">{(telemetry?.distance_m/1000 || 0).toFixed(2)} <small>km</small></span></div>
+                        <div className="tele-item text-right"><label className="label-tiny">VELOCITY</label><span className="val" style={{ color: '#10b981' }}>{isGreenCorridor ? '75' : '55'} <small>km/h</small></span></div>
+                    </div>
+                    <div className="triage-total">
+                        <label className="label-tiny">ESTIMATED SURVIVAL TIME</label>
+                        <span className="total-val">{telemetry?.total_rescue_time_min || 0} <small>MIN</small></span>
+                    </div>
+                </footer>
             </aside>
 
-            {/* MAP INTERFACE */}
-            <main style={{ flex: 1, position: 'relative' }}>
-                <MapContainer center={[26.91, 75.78]} zoom={13} style={{ height: '100%', width: '100%' }} zoomControl={false}>
-                    <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+            <main className="map-area">
+                <MapContainer center={savedPos} zoom={savedZoom} style={{ height: '100%' }} zoomControl={false}>
+                    <TileLayer url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png" attribution='&copy; CARTO' />
+                    <MapEventsHandler onMapClick={handleMapClick} onViewStateChange={(c, z) => { localStorage.setItem('map_pos', JSON.stringify(c)); localStorage.setItem('map_zoom', z); }} activeCity={activeCity} />
                     
-                    <MapAnimate center={activeCity?.center} cityId={activeCity?.id} />
-                    <MapClickHandler />
-
-                    {userLocation && <Marker position={userLocation} icon={icons.user}><Popup>Emergency Vehicle Origin</Popup></Marker>}
+                    {userLocation && <Marker position={userLocation} icon={icons.user} />}
+                    {activeCity.targets[category].map((t) => (<Marker key={t.name} position={[t.lat, t.lng]} icon={icons[category]} />))}
                     
-                    {activeCity?.targets[category].map((target, idx) => (
-                        <Marker key={idx} position={[target.lat, target.lng]} icon={icons[category]}>
-                            <Popup>{target.name}</Popup>
-                        </Marker>
-                    ))}
+                    {isPoliceSync && telemetry?.escort && (
+                        <>
+                            <Marker position={[telemetry.escort.lat, telemetry.escort.lng]} icon={icons.police} />
+                            <Polyline 
+                                positions={[[telemetry.escort.lat, telemetry.escort.lng], [telemetry.escort.meet_lat, telemetry.escort.meet_lng]]} 
+                                pathOptions={{ color: '#1e293b', weight: 1.5, dashArray: '8, 12', opacity: 0.6 }} 
+                            />
+                        </>
+                    )}
 
                     {route.length > 0 && (
                         <Polyline 
+                            key={`path-${targetHour}-${currentTarget?.name}-${isGreenCorridor}-${telemetry?.intensity}`}
                             positions={route} 
-                            /* Updated to a Purple smooth curve look */
-                            pathOptions={{ color: '#8b5cf6', weight: 7, lineCap: 'round', lineJoin: 'round', opacity: 0.85 }} 
+                            pathOptions={{ 
+                                color: isGreenCorridor ? '#10b981' : theme.color, 
+                                weight: 7, 
+                                className: isGreenCorridor ? 'neon-pulse' : '' 
+                            }} 
                         />
                     )}
                 </MapContainer>
-
-                {/* Professional Overlay */}
-                <div style={{ position: 'absolute', top: '20px', right: '20px', background: 'white', padding: '10px 18px', borderRadius: '30px', fontWeight: 700, fontSize: '11px', color: 'var(--slate-900)', zIndex: 1000, display: 'flex', alignItems: 'center', gap: '8px' }} className="shadow-soft">
-                   <span style={{ color: '#8b5cf6' }}>●</span> MULTI-UNIT AI ROUTING
-                </div>
             </main>
         </div>
     );

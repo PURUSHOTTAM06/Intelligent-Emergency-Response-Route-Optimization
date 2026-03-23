@@ -1,71 +1,110 @@
-from environment import JaipurTrafficEnv
-from agent import AmbulanceAgent
-from memory import ExperienceMemory
 import torch
 import random
+import logging
+import os
+import osmnx as ox
+import networkx as nx
+
+# --- IMPORT MODULES ---
+from environment import MultiCityTrafficEnv
+from agent import AmbulanceAgent
+from memory import ExperienceMemory
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("TRAINING_CORE")
+
 # --- CONFIGURATION ---
-MAP_PATH = "jaipur_map.graphml"
-STATE_DIM = 6 # Features we defined in Step 1
-ACTION_DIM = 8 # Max branching factor (typical for intersections)
+CITIES = ["jaipur", "delhi", "allahabad", "bangalore"]
+STATE_DIM = 6
+ACTION_DIM = 8
 BATCH_SIZE = 64
-EPISODES = 500
+EPISODES = 1200  # Increased for multi-city generalization
 
-# --- INITIALIZATION ---
-env = JaipurTrafficEnv(MAP_PATH)
+# --- MULTI-SECTOR INITIALIZATION ---
+city_envs = {}
+logger.info("Initializing Global Neural Training...")
+
+for city in CITIES:
+    map_path = f"{city}_map.graphml"
+    if os.path.exists(map_path):
+        logger.info(f"🦾 Loading Sector: {city}...")
+        try:
+            # We must apply the connectivity fix here too, 
+            # otherwise the AI will step into a dead-end and crash the loop.
+            G = ox.load_graphml(map_path)
+            scc = max(nx.strongly_connected_components(G), key=len) if G.is_directed() else max(nx.connected_components(G), key=len)
+            clean_G = G.subgraph(scc).copy()
+            
+            env = MultiCityTrafficEnv(city, map_path)
+            env.G = ox.project_graph(clean_G, to_crs="EPSG:4326")
+            city_envs[city] = env
+            logger.info(f"✅ {city.upper()} loaded into training matrix.")
+        except Exception as e:
+            logger.error(f"❌ Failed to load {city}: {e}")
+
+if not city_envs:
+    raise ValueError("CRITICAL: No maps found. Please ensure .graphml files exist.")
+
+# --- AI AGENT SETUP ---
 agent = AmbulanceAgent(STATE_DIM, ACTION_DIM)
-memory = ExperienceMemory(capacity=20000)
+memory = ExperienceMemory(capacity=50000) # Increased memory for multi-city experiences
 
-print("🚀 TRAINING_STARTED: Simulated Jaipur Emergency Dispatch...")
+print(f"\n🚀 CROSS-SECTOR TRAINING STARTED: {len(city_envs)} CITIES LIVE...")
 
 for episode in range(EPISODES):
-    # 1. Reset Env and get Initial State
-    # Note: For our graph, a state is the feature vector of the current road
+    # 1. Teleport AI to a random city for this episode
+    target_city = random.choice(list(city_envs.keys()))
+    env = city_envs[target_city]
+    
+    # 2. Simulate random hour traffic and get features
+    # Assuming your env.simulate_traffic_step() assigns random traffic weights
     current_graph = env.simulate_traffic_step()
     features = env.get_feature_matrix()
     
-    # Let's pick a random start edge for training
+    # 3. Drop the agent on a random road
     current_edge = random.choice(list(features.keys()))
     state = features[current_edge]
     
     total_reward = 0
     
-    for step in range(100): # Max steps per dispatch
-        # 2. Agent chooses a road
+    for step in range(120): # Max steps per dispatch
+        # Agent chooses a path
         action = agent.select_action(state)
         
-        # 3. Step Environment (Find neighbors and move)
-        # In a real graph, we'd find actual connected edges. 
-        # For training, we simulate the 'next' state based on graph connectivity.
+        # Find neighbors (connected roads)
         neighbors = list(current_graph.out_edges(current_edge[1], keys=True))
         
-        if not neighbors: # Dead end
-            reward = -10
+        if not neighbors: # Dead end trap
+            reward = -20 # Heavy penalty for hitting dead ends
             done = True
-            next_state = state # Stay in place
+            next_state = state 
         else:
             # Action maps to one of the neighboring edges
             next_edge = neighbors[action % len(neighbors)]
             next_state = features[next_edge]
             
-            # REWARD: Negative of the AI Weight (Time/Congestion)
-            # We want to MINIMIZE time, so we MAXIMIZE negative time
-            reward = -current_graph[next_edge[0]][next_edge[1]][next_edge[2]]['ai_weight']
+            # REWARD FUNCTION: 
+            # Penalize heavily for high ai_weight (traffic/time)
+            raw_weight = current_graph[next_edge[0]][next_edge[1]][next_edge[2]].get('ai_weight', 10.0)
+            reward = -raw_weight
             done = False
             current_edge = next_edge
 
-        # 4. Store and Learn
+        # Store experience in the global memory bank
         memory.push(state, action, reward, next_state, done)
+        
+        # Learn from past experiences
         agent.learn(memory, BATCH_SIZE)
         
         state = next_state
         total_reward += reward
         if done: break
 
-    # 5. Periodic Target Network Sync
-    if episode % 10 == 0:
+    # Periodic Target Network Sync & Logging
+    if episode % 20 == 0:
         agent.update_target_network()
-        print(f"📊 EPISODE {episode} | AVG_REWARD: {total_reward:.2f} | EPSILON: {agent.epsilon:.2f}")
+        print(f"📊 EP: {episode:4d} | CITY: {target_city.upper():10s} | REWARD: {total_reward:7.2f} | EPSILON: {agent.epsilon:.3f}")
 
-# 6. Save the Brain
+# --- SAVE THE GLOBAL BRAIN ---
 torch.save(agent.policy_net.state_dict(), "ambulance_brain.pth")
-print("✅ TRAINING_COMPLETE: model saved as ambulance_brain.pth")
+print("\n✅ GLOBAL TRAINING COMPLETE: Multi-Sector Brain saved as 'ambulance_brain.pth'")
