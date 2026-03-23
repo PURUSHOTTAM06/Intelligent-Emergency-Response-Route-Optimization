@@ -8,7 +8,7 @@ app.use(cors({ origin: '*', methods: ['GET', 'POST'] }));
 app.use(express.json());
 
 const PORT = 5000;
-const AI_URL = "http://localhost:8000"; 
+const AI_URL = process.env.AI_URL || "https://routeflow-ai-engine.onrender.com";
 
 const getClinicalPulse = (hosp, hour) => {
     let arrivalRate = 0.15; 
