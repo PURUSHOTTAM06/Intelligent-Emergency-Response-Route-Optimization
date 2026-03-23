@@ -19,6 +19,8 @@ const VEHICLE_PROFILES = {
     police_rapid: { name: 'Police Interceptor', baseSpeed: 70, icon: '🚓' }
 };
 
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000';
+
 function MapEventsHandler({ onMapClick, activeCity }) {
     const map = useMap();
     const lastCityId = useRef(activeCity?.id);
@@ -67,8 +69,9 @@ function App() {
     }, [uiHour]);
 
     // FETCH CITY DATA (Updates Wait Times when Time changes)
+   // FETCH CITY DATA (Updates Wait Times when Time changes)
     useEffect(() => {
-        axios.get(`http://localhost:5000/api/cities?hour=${targetHour}`).then(res => {
+        axios.get(`${API_BASE_URL}/api/cities?hour=${targetHour}`).then(res => {
             setCities(res.data);
             const savedId = localStorage.getItem('active_city_id') || 'jaipur';
             setActiveCity(res.data.find(c => c.id === savedId) || res.data[0]);
@@ -100,7 +103,7 @@ function App() {
         if (!userLocation || !activeCity) return;
         setIsLoading(true);
         try {
-            const res = await axios.post('http://localhost:5000/dispatch', {
+            const res = await axios.post(`${API_BASE_URL}/dispatch`, {
                 cityId: activeCity.id, user_lat: userLocation.lat, user_lng: userLocation.lng,
                 target_lat: node.lat, target_lng: node.lng, target_hour: hour,
                 isGreenCorridor: corridor, isPoliceSync: sync, isForecast: forecast
