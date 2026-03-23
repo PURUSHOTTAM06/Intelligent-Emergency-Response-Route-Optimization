@@ -19,30 +19,24 @@ logger = logging.getLogger("AI_ENGINE")
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# Load Neural Brain
+# --- NEURAL BRAIN LOADING ---
 STATE_DIM, ACTION_DIM = 6, 8
 agent = AmbulanceAgent(STATE_DIM, ACTION_DIM)
 if os.path.exists("ambulance_brain.pth"):
+    # Use map_location='cpu' to ensure it works on Render's free tier
     agent.policy_net.load_state_dict(torch.load("ambulance_brain.pth", map_location=torch.device('cpu')))
     agent.policy_net.eval()
+    logger.info("🧠 Neural Brain Synced.")
 
-# --- HIGH-SPEED SECTOR INIT ---
-city_list = ["jaipur",  "allahabad", ]
+# --- LAZY LOADING REGISTRY ---
+# We keep the environments empty at startup to bypass the Render timeout.
+city_list = ["jaipur", "allahabad"]
 city_synonyms = {"prayagraj": "allahabad"}
 city_envs = {}
 
-for city in city_list:
-    map_path = f"{city}_map.graphml"
-    if os.path.exists(map_path):
-        try:
-            logger.info(f"🦾 TURBO_INIT: {city}...")
-            G = ox.load_graphml(map_path)
-            scc = max(nx.strongly_connected_components(G), key=len) if G.is_directed() else max(nx.connected_components(G), key=len)
-            env = MultiCityTrafficEnv(city, map_path)
-            env.G = ox.project_graph(G.subgraph(scc).copy(), to_crs="EPSG:4326")
-            city_envs[city] = env
-            logger.info(f"✅ {city.upper()} Sector Ready.")
-        except Exception as e: logger.error(f"Fail {city}: {e}")
+@app.get("/")
+async def health_check():
+    return {"status": "online", "loaded_sectors": list(city_envs.keys())}
 
 class RouteRequest(BaseModel):
     city_query: str
@@ -56,17 +50,39 @@ class RouteRequest(BaseModel):
 async def get_route(req: RouteRequest):
     raw_query = req.city_query.lower()
     target_id = next((cid for cid in city_list if cid in raw_query), None)
-    if not target_id: target_id = next((cid for syn, cid in city_synonyms.items() if syn in raw_query), None)
+    if not target_id: 
+        target_id = next((cid for syn, cid in city_synonyms.items() if syn in raw_query), None)
     
-    env = city_envs.get(target_id)
-    if not env: raise HTTPException(status_code=400, detail="CITY_NOT_LOADED")
+    if not target_id:
+        raise HTTPException(status_code=400, detail="CITY_NOT_SUPPORTED")
+
+    # --- LAZY LOAD TRIGGER ---
+    # This is the "Turbo Hack". If the city isn't in memory, we load it now.
+    if target_id not in city_envs:
+        map_path = f"{target_id}_map.graphml"
+        if os.path.exists(map_path):
+            try:
+                logger.info(f"🦾 ON_DEMAND_LOAD: {target_id} (This may take a moment)...")
+                G = ox.load_graphml(map_path)
+                scc = max(nx.strongly_connected_components(G), key=len) if G.is_directed() else max(nx.connected_components(G), key=len)
+                env = MultiCityTrafficEnv(target_id, map_path)
+                env.G = ox.project_graph(G.subgraph(scc).copy(), to_crs="EPSG:4326")
+                city_envs[target_id] = env
+                logger.info(f"✅ {target_id.upper()} Sector Activated.")
+            except Exception as e:
+                logger.error(f"Lazy Load Failed for {target_id}: {e}")
+                raise HTTPException(status_code=500, detail="MAP_LOAD_FAILURE")
+        else:
+            raise HTTPException(status_code=404, detail="MAP_FILE_MISSING")
+
+    env = city_envs[target_id]
 
     try:
         # 1. TEMPORAL DYNAMICS
         h = req.target_hour + (0.42 if req.is_forecast else 0)
         rush_intensity = math.exp(-(h-9)**2/6) + math.exp(-(h-18)**2/6)
         
-        # 2. NEURAL INFERENCE (Vectorized for Speed)
+        # 2. NEURAL INFERENCE
         feat_dict = env.get_feature_matrix(h)
         edge_keys = list(feat_dict.keys())
         feat_array = np.array([feat_dict[k] for k in edge_keys], dtype=np.float32)
@@ -76,9 +92,8 @@ async def get_route(req: RouteRequest):
             q_values = agent.policy_net(features_tensor)
             friction_map = dict(zip(edge_keys, (1.0 / (torch.abs(q_values.mean(dim=1)) + 0.01)).numpy()))
 
-        # 3. AGGRESSIVE LARGE-CITY REROUTING
+        # 3. ROUTING LOGIC
         priority_roads = ['primary', 'trunk', 'motorway', 'motorway_link', 'trunk_link', 'primary_link']
-
         for u, v, k, data in env.G.edges(keys=True, data=True):
             road_type = data.get('highway', 'residential')
             if isinstance(road_type, list): road_type = road_type[0]
@@ -89,17 +104,17 @@ async def get_route(req: RouteRequest):
             if req.is_green_corridor:
                 traffic_mult = 0.2 if road_type in priority_roads else 0.8
             else:
-                penalty_weight = 120.0 if target_id in ['delhi', 'bangalore'] else 60.0
+                penalty_weight = 60.0 # Optimized for smaller cities
                 traffic_mult = 1.0 + (rush_intensity * penalty_weight if road_type in priority_roads else rush_intensity * 8.0)
             
             data['ml_cost'] = length * traffic_mult * ai_friction
 
-        # 4. ASTAR PATHFINDING
+        # 4. ASTAR
         orig = ox.distance.nearest_nodes(env.G, req.start_lng, req.start_lat)
         dest = ox.distance.nearest_nodes(env.G, req.end_lng, req.end_lat)
         route_nodes = nx.astar_path(env.G, orig, dest, weight='ml_cost')
 
-        # 5. POLICE INTERCEPTOR SYNC (Restored Fast Version)
+        # 5. POLICE SYNC
         escort_data = None
         if req.is_police_sync:
             mid_node = route_nodes[len(route_nodes)//2]
@@ -113,7 +128,7 @@ async def get_route(req: RouteRequest):
                 "meet_lat": b_lat, "meet_lng": b_lng
             }
 
-        # 6. TELEMETRY
+        # 6. RETURN DATA
         actual_dist = sum(env.G.get_edge_data(u, v)[0].get('length', 100) for u, v in zip(route_nodes[:-1], route_nodes[1:]))
         avg_speed = 75 if req.is_green_corridor else max(5, 50 - (rush_intensity * 40))
         
@@ -133,4 +148,6 @@ async def get_route(req: RouteRequest):
         raise HTTPException(status_code=500, detail="PATHFINDING_ERROR")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Render uses the $PORT environment variable
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
