@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+torch
+osmnx
+networkx
+numpy
+pydantic
