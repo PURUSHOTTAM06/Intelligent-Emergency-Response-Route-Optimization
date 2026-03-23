@@ -12,7 +12,13 @@ const getIcon = (color) => new L.Icon({
     iconSize: [22, 35], iconAnchor: [11, 35]
 });
 
-const icons = { user: getIcon('blue'), hospitals: getIcon('red'), schools: getIcon('gold'), offices: getIcon('violet'), police: getIcon('gray') };
+const icons = { 
+    user: getIcon('blue'), 
+    hospitals: getIcon('red'), 
+    schools: getIcon('gold'), 
+    offices: getIcon('violet'), 
+    police: getIcon('gray') 
+};
 
 const VEHICLE_PROFILES = {
     als_ambulance: { name: 'ALS Ambulance', baseSpeed: 55, icon: '🚑' },
@@ -21,20 +27,27 @@ const VEHICLE_PROFILES = {
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000';
 
-function MapEventsHandler({ onMapClick, activeCity }) {
+// --- MAP UTILITIES ---
+function MapEventsHandler({ onMapClick, activeCity, route }) {
     const map = useMap();
     const lastCityId = useRef(activeCity?.id);
 
+    // Fly to city when changed
     useEffect(() => {
         if (activeCity && activeCity.id !== lastCityId.current) {
-            map.zoomOut(1, { animate: true });
-            setTimeout(() => {
-                map.flyTo(activeCity.center, 12, { animate: true, duration: 1.8 });
-            }, 300);
+            map.flyTo(activeCity.center, 12, { animate: true, duration: 1.8 });
             lastCityId.current = activeCity.id;
         }
         map.invalidateSize();
     }, [activeCity, map]);
+
+    // Auto-zoom to route when it appears
+    useEffect(() => {
+        if (route && route.length > 0) {
+            const bounds = L.polyline(route).getBounds();
+            map.fitBounds(bounds, { padding: [50, 50] });
+        }
+    }, [route, map]);
 
     useMapEvents({ click(e) { onMapClick(e.latlng); } });
     return null;
@@ -42,12 +55,8 @@ function MapEventsHandler({ onMapClick, activeCity }) {
 
 function App() {
     const [targetHour, setTargetHour] = useState(parseInt(localStorage.getItem('saved_hour')) || 12);
-    const [uiHour, setUiHour] = useState(targetHour); // UI state for zero-lag slider
-    
+    const [uiHour, setUiHour] = useState(targetHour); 
     const [userLocation, setUserLocation] = useState(JSON.parse(localStorage.getItem('user_loc')) || null);
-    const savedPos = JSON.parse(localStorage.getItem('map_pos')) || { lat: 26.91, lng: 75.78 };
-    const savedZoom = parseInt(localStorage.getItem('map_zoom')) || 12;
-
     const [cities, setCities] = useState([]);
     const [activeCity, setActiveCity] = useState(null);
     const [category, setCategory] = useState('hospitals');
@@ -56,7 +65,6 @@ function App() {
     const [route, setRoute] = useState([]);
     const [telemetry, setTelemetry] = useState(null);
     const [isLoading, setIsLoading] = useState(false);
-    
     const [isGreenCorridor, setIsGreenCorridor] = useState(false);
     const [isPoliceSync, setIsPoliceSync] = useState(false);
     const [isForecast, setIsForecast] = useState(false);
@@ -68,25 +76,19 @@ function App() {
         return { color: '#2563eb', label: 'OPTIMAL FLOW' };
     }, [uiHour]);
 
-    // FETCH CITY DATA (Updates Wait Times when Time changes)
-   // FETCH CITY DATA (Updates Wait Times when Time changes)
     useEffect(() => {
         axios.get(`${API_BASE_URL}/api/cities?hour=${targetHour}`).then(res => {
             setCities(res.data);
             const savedId = localStorage.getItem('active_city_id') || 'jaipur';
             setActiveCity(res.data.find(c => c.id === savedId) || res.data[0]);
-        });
+        }).catch(err => console.error("Server Offline", err));
     }, [targetHour]);
 
-    // DYNAMIC HOSPITAL SORTING
     const sortedNodes = useMemo(() => {
         if (!activeCity?.targets?.[category]) return [];
         let list = [...activeCity.targets[category]];
-        
         if (category === 'hospitals' && userLocation) {
-            const isPeak = (targetHour >= 8 && targetHour <= 11) || (targetHour >= 17 && targetHour <= 21);
-            const speed = isGreenCorridor ? 75 : (isPeak ? 15 : VEHICLE_PROFILES[selectedVehicle].baseSpeed);
-            
+            const speed = isGreenCorridor ? 75 : VEHICLE_PROFILES[selectedVehicle].baseSpeed;
             return list.sort((a, b) => {
                 const distA = L.latLng(userLocation).distanceTo([a.lat, a.lng]) / 1000;
                 const distB = L.latLng(userLocation).distanceTo([b.lat, b.lng]) / 1000;
@@ -96,9 +98,8 @@ function App() {
             });
         }
         return list;
-    }, [activeCity, category, userLocation, targetHour, selectedVehicle, isGreenCorridor]);
+    }, [activeCity, category, userLocation, selectedVehicle, isGreenCorridor]);
 
-    // THE AI DISPATCH TRIGGER
     const triggerDispatch = useCallback(async (node, hour, corridor, sync, forecast) => {
         if (!userLocation || !activeCity) return;
         setIsLoading(true);
@@ -108,22 +109,23 @@ function App() {
                 target_lat: node.lat, target_lng: node.lng, target_hour: hour,
                 isGreenCorridor: corridor, isPoliceSync: sync, isForecast: forecast
             });
+
             if (res.data.route) {
-                // STITCHING: Forcing the path to perfectly touch the User Marker and Target Marker
+                // FIXED: Map to [lat, lng] array format for Leaflet
+                const formattedPath = res.data.route.map(p => [p.lat, p.lng]);
                 const stitchedRoute = [
-                    { lat: userLocation.lat, lng: userLocation.lng },
-                    ...res.data.route,
-                    { lat: node.lat, lng: node.lng }
+                    [userLocation.lat, userLocation.lng],
+                    ...formattedPath,
+                    [node.lat, node.lng]
                 ];
                 setRoute(stitchedRoute);
                 setTelemetry(res.data.telemetry);
                 setCurrentTarget(node);
             }
-        } catch (e) { console.error("Mission Sync Error"); }
+        } catch (e) { console.error("Mission Sync Error", e); }
         setIsLoading(false);
     }, [activeCity, userLocation]);
 
-    // AUTO-REROUTE WHEN CONDITIONS CHANGE
     useEffect(() => {
         if (currentTarget) triggerDispatch(currentTarget, targetHour, isGreenCorridor, isPoliceSync, isForecast);
     }, [targetHour, isGreenCorridor, isPoliceSync, isForecast]);
@@ -141,7 +143,7 @@ function App() {
         setRoute([]); setTelemetry(null); setCurrentTarget(null);
     };
 
-    if (!activeCity) return null;
+    if (!activeCity) return <div className="loading-screen">INITIALIZING SECTORS...</div>;
 
     return (
         <div className="main-layout">
@@ -181,11 +183,9 @@ function App() {
                             <span>{theme.label}</span>
                             <span className="time-display">{uiHour}:00</span>
                         </div>
-                        {/* DEBOUNCED SLIDER: Instant UI feedback, API call only on MouseUp */}
                         <input type="range" min="0" max="23" value={uiHour} className="custom-range" 
                                onChange={(e) => setUiHour(parseInt(e.target.value))} 
                                onMouseUp={() => { setTargetHour(uiHour); localStorage.setItem('saved_hour', uiHour); }}
-                               onTouchEnd={() => { setTargetHour(uiHour); localStorage.setItem('saved_hour', uiHour); }}
                                style={{ '--accent': theme.color }} />
                     </div>
 
@@ -227,16 +227,16 @@ function App() {
                         <div className="tele-item text-right"><label className="label-tiny">VELOCITY</label><span className="val" style={{ color: '#10b981' }}>{isGreenCorridor ? '75' : '55'} <small>km/h</small></span></div>
                     </div>
                     <div className="triage-total">
-                        <label className="label-tiny">ESTIMATED SURVIVAL TIME</label>
+                        <label className="label-tiny">ESTIMATED RESCUE TIME</label>
                         <span className="total-val">{telemetry?.total_rescue_time_min || 0} <small>MIN</small></span>
                     </div>
                 </footer>
             </aside>
 
             <main className="map-area">
-                <MapContainer center={savedPos} zoom={savedZoom} style={{ height: '100%' }} zoomControl={false}>
+                <MapContainer center={[26.91, 75.78]} zoom={12} style={{ height: '100%' }} zoomControl={false}>
                     <TileLayer url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png" attribution='&copy; CARTO' />
-                    <MapEventsHandler onMapClick={handleMapClick} onViewStateChange={(c, z) => { localStorage.setItem('map_pos', JSON.stringify(c)); localStorage.setItem('map_zoom', z); }} activeCity={activeCity} />
+                    <MapEventsHandler onMapClick={handleMapClick} activeCity={activeCity} route={route} />
                     
                     {userLocation && <Marker position={userLocation} icon={icons.user} />}
                     {activeCity.targets[category].map((t) => (<Marker key={t.name} position={[t.lat, t.lng]} icon={icons[category]} />))}
@@ -246,18 +246,19 @@ function App() {
                             <Marker position={[telemetry.escort.lat, telemetry.escort.lng]} icon={icons.police} />
                             <Polyline 
                                 positions={[[telemetry.escort.lat, telemetry.escort.lng], [telemetry.escort.meet_lat, telemetry.escort.meet_lng]]} 
-                                pathOptions={{ color: '#1e293b', weight: 1.5, dashArray: '8, 12', opacity: 0.6 }} 
+                                pathOptions={{ color: '#1e293b', weight: 2, dashArray: '5, 10', opacity: 0.6 }} 
                             />
                         </>
                     )}
 
                     {route.length > 0 && (
                         <Polyline 
-                            key={`path-${targetHour}-${currentTarget?.name}-${isGreenCorridor}-${telemetry?.intensity}`}
+                            key={`path-${currentTarget?.name}-${isGreenCorridor}`}
                             positions={route} 
                             pathOptions={{ 
                                 color: isGreenCorridor ? '#10b981' : theme.color, 
-                                weight: 7, 
+                                weight: 8, 
+                                opacity: 0.8,
                                 className: isGreenCorridor ? 'neon-pulse' : '' 
                             }} 
                         />
