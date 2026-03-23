@@ -27,8 +27,8 @@ if os.path.exists("ambulance_brain.pth"):
     agent.policy_net.eval()
 
 # --- HIGH-SPEED SECTOR INIT ---
-city_list = ["jaipur", "delhi", "allahabad", "bangalore"]
-city_synonyms = {"prayagraj": "allahabad", "bengaluru": "bangalore", "new delhi": "delhi"}
+city_list = ["jaipur",  "allahabad", ]
+city_synonyms = {"prayagraj": "allahabad"}
 city_envs = {}
 
 for city in city_list:
