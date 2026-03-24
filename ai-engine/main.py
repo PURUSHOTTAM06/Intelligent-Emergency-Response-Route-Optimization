@@ -7,7 +7,8 @@ import uvicorn
 import numpy as np
 import random
 import math
-import asyncio # Added for background task
+import asyncio
+import pickle
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,56 +26,57 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_DIM, ACTION_DIM = 6, 8
 agent = AmbulanceAgent(STATE_DIM, ACTION_DIM)
-city_list = ["jaipur", "allahabad"]
+
+if os.environ.get("RENDER"):
+    city_list = ["jaipur"] 
+else:
+    city_list = ["jaipur", "allahabad"]
+
 city_envs = {}
-app_ready = False # Flag to track if maps are finished loading
+app_ready = False 
 
 # --- ASYNC BACKGROUND BOOTSTRAP ---
 async def load_sectors():
     global app_ready
-    # 1. Load Neural Brain
     brain_path = os.path.join(BASE_DIR, "ambulance_brain.pth")
     if os.path.exists(brain_path):
-        agent.policy_net.load_state_dict(torch.load(brain_path, map_location=torch.device('cpu')))
-        agent.policy_net.eval()
-        logger.info("🧠 Neural Brain Synced.")
+        try:
+            agent.policy_net.load_state_dict(torch.load(brain_path, map_location=torch.device('cpu')))
+            agent.policy_net.eval()
+            logger.info("🧠 Neural Brain Synced.")
+        except Exception as e:
+            logger.error(f"❌ Brain Load Failed: {e}")
 
-    # 2. Load Maps in background to prevent Port Timeout
-    logger.info("🦾 BOOTING SECTORS (Background loading starting)...")
+    logger.info("🦾 BOOTING SECTORS (Fast Boot Active)...")
     for cid in city_list:
-        map_path = os.path.join(BASE_DIR, f"{cid}_map.graphml")
-        if os.path.exists(map_path):
+        path_pkl = os.path.join(BASE_DIR, f"{cid}_map.pkl")
+        path_graphml = os.path.join(BASE_DIR, f"{cid}_map.graphml")
+        target_path = path_pkl if os.path.exists(path_pkl) else path_graphml
+        
+        if os.path.exists(target_path):
             try:
-                logger.info(f"📍 Loading {cid.upper()} map file...")
-                # We use run_in_executor to keep the loop from freezing during heavy I/O
-                loop = asyncio.get_event_loop()
-                G = await loop.run_in_executor(None, ox.load_graphml, map_path)
-                
-                scc = max(nx.strongly_connected_components(G), key=len) if G.is_directed() else max(nx.connected_components(G), key=len)
-                
-                env = MultiCityTrafficEnv(cid, map_path)
-                env.G = ox.project_graph(G.subgraph(scc).copy(), to_crs="EPSG:4326")
+                # The Env class now handles .pkl correctly
+                env = MultiCityTrafficEnv(cid, target_path)
                 city_envs[cid] = env
                 logger.info(f"✅ {cid.upper()} Sector Ready.")
             except Exception as e:
                 logger.error(f"❌ Failed to boot {cid}: {e}")
         else:
-            logger.warning(f"⚠️ Map file {map_path} not found.")
+            logger.warning(f"⚠️ No map file found for {cid}")
     
     app_ready = True
     logger.info("🚀 SYSTEM FULLY INITIALIZED.")
 
 @app.on_event("startup")
 async def startup_event():
-    # This triggers the loading task immediately after uvicorn binds the port
     asyncio.create_task(load_sectors())
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def health_check():
     return {
         "status": "online" if app_ready else "loading", 
         "loaded_sectors": list(city_envs.keys()),
-        "engine": "Async_EagerLoad_V2"
+        "engine": "Async_EagerLoad_V2_Fast"
     }
 
 class RouteRequest(BaseModel):
@@ -99,11 +101,9 @@ async def get_route(req: RouteRequest):
     env = city_envs[target_id]
 
     try:
-        # 1. TEMPORAL DYNAMICS
         h = req.target_hour + (0.42 if req.is_forecast else 0)
         rush_intensity = math.exp(-(h-9)**2/6) + math.exp(-(h-18)**2/6)
         
-        # 2. NEURAL INFERENCE
         feat_dict = env.get_feature_matrix(h)
         edge_keys = list(feat_dict.keys())
         feat_array = np.array([feat_dict[k] for k in edge_keys], dtype=np.float32)
@@ -113,7 +113,6 @@ async def get_route(req: RouteRequest):
             q_values = agent.policy_net(features_tensor)
             friction_map = dict(zip(edge_keys, (1.0 / (torch.abs(q_values.mean(dim=1)) + 0.01)).numpy()))
 
-        # 3. ROUTING LOGIC
         priority_roads = ['primary', 'trunk', 'motorway', 'motorway_link', 'trunk_link', 'primary_link']
         for u, v, k, data in env.G.edges(keys=True, data=True):
             road_type = data.get('highway', 'residential')
@@ -129,12 +128,10 @@ async def get_route(req: RouteRequest):
             
             data['ml_cost'] = length * traffic_mult * ai_friction
 
-        # 4. ASTAR
         orig = ox.distance.nearest_nodes(env.G, req.start_lng, req.start_lat)
         dest = ox.distance.nearest_nodes(env.G, req.end_lng, req.end_lat)
         route_nodes = nx.astar_path(env.G, orig, dest, weight='ml_cost')
 
-        # 5. POLICE SYNC
         escort_data = None
         if req.is_police_sync:
             mid_node = route_nodes[len(route_nodes)//2]
@@ -145,7 +142,6 @@ async def get_route(req: RouteRequest):
             best_unit = fleet_nodes[dist_list.index(min(dist_list))]
             escort_data = {"lat": env.G.nodes[best_unit]['y'], "lng": env.G.nodes[best_unit]['x'], "meet_lat": b_lat, "meet_lng": b_lng}
 
-        # 6. RETURN DATA
         actual_dist = sum(env.G.get_edge_data(u, v)[0].get('length', 100) for u, v in zip(route_nodes[:-1], route_nodes[1:]))
         avg_speed = 75 if req.is_green_corridor else max(5, 50 - (rush_intensity * 40))
         
