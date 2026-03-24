@@ -7,6 +7,7 @@ import uvicorn
 import numpy as np
 import random
 import math
+import asyncio # Added for background task
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,9 +27,11 @@ STATE_DIM, ACTION_DIM = 6, 8
 agent = AmbulanceAgent(STATE_DIM, ACTION_DIM)
 city_list = ["jaipur", "allahabad"]
 city_envs = {}
+app_ready = False # Flag to track if maps are finished loading
 
-# --- STARTUP BOOTSTRAP (Eager Loading) ---
-def bootstrap():
+# --- ASYNC BACKGROUND BOOTSTRAP ---
+async def load_sectors():
+    global app_ready
     # 1. Load Neural Brain
     brain_path = os.path.join(BASE_DIR, "ambulance_brain.pth")
     if os.path.exists(brain_path):
@@ -36,16 +39,17 @@ def bootstrap():
         agent.policy_net.eval()
         logger.info("🧠 Neural Brain Synced.")
 
-    # 2. Load Maps into RAM immediately
-    logger.info("🦾 BOOTING SECTORS (Pre-loading maps)...")
+    # 2. Load Maps in background to prevent Port Timeout
+    logger.info("🦾 BOOTING SECTORS (Background loading starting)...")
     for cid in city_list:
         map_path = os.path.join(BASE_DIR, f"{cid}_map.graphml")
         if os.path.exists(map_path):
             try:
-                logger.info(f"📍 Loading {cid.upper()} map file ({map_path})...")
-                G = ox.load_graphml(map_path)
+                logger.info(f"📍 Loading {cid.upper()} map file...")
+                # We use run_in_executor to keep the loop from freezing during heavy I/O
+                loop = asyncio.get_event_loop()
+                G = await loop.run_in_executor(None, ox.load_graphml, map_path)
                 
-                # Connectivity check
                 scc = max(nx.strongly_connected_components(G), key=len) if G.is_directed() else max(nx.connected_components(G), key=len)
                 
                 env = MultiCityTrafficEnv(cid, map_path)
@@ -56,16 +60,21 @@ def bootstrap():
                 logger.error(f"❌ Failed to boot {cid}: {e}")
         else:
             logger.warning(f"⚠️ Map file {map_path} not found.")
+    
+    app_ready = True
+    logger.info("🚀 SYSTEM FULLY INITIALIZED.")
 
-# Run the bootstrap before the app starts
-bootstrap()
+@app.on_event("startup")
+async def startup_event():
+    # This triggers the loading task immediately after uvicorn binds the port
+    asyncio.create_task(load_sectors())
 
 @app.get("/")
 async def health_check():
     return {
-        "status": "online", 
+        "status": "online" if app_ready else "loading", 
         "loaded_sectors": list(city_envs.keys()),
-        "engine": "EagerLoad_V1"
+        "engine": "Async_EagerLoad_V2"
     }
 
 class RouteRequest(BaseModel):
@@ -78,6 +87,9 @@ class RouteRequest(BaseModel):
 
 @app.post("/get_route")
 async def get_route(req: RouteRequest):
+    if not app_ready:
+        raise HTTPException(status_code=503, detail="SYSTEM_BOOTING_PLEASE_WAIT")
+
     raw_query = req.city_query.lower()
     target_id = next((cid for cid in city_list if cid in raw_query), None)
     
@@ -106,7 +118,6 @@ async def get_route(req: RouteRequest):
         for u, v, k, data in env.G.edges(keys=True, data=True):
             road_type = data.get('highway', 'residential')
             if isinstance(road_type, list): road_type = road_type[0]
-            
             ai_friction = friction_map.get((u, v, k), 1.0)
             length = data.get('length', 100)
             
@@ -132,10 +143,7 @@ async def get_route(req: RouteRequest):
             b_lat, b_lng = env.G.nodes[mid_node]['y'], env.G.nodes[mid_node]['x']
             dist_list = [((env.G.nodes[fn]['y']-b_lat)**2 + (env.G.nodes[fn]['x']-b_lng)**2) for fn in fleet_nodes]
             best_unit = fleet_nodes[dist_list.index(min(dist_list))]
-            escort_data = {
-                "lat": env.G.nodes[best_unit]['y'], "lng": env.G.nodes[best_unit]['x'], 
-                "meet_lat": b_lat, "meet_lng": b_lng
-            }
+            escort_data = {"lat": env.G.nodes[best_unit]['y'], "lng": env.G.nodes[best_unit]['x'], "meet_lat": b_lat, "meet_lng": b_lng}
 
         # 6. RETURN DATA
         actual_dist = sum(env.G.get_edge_data(u, v)[0].get('length', 100) for u, v in zip(route_nodes[:-1], route_nodes[1:]))
