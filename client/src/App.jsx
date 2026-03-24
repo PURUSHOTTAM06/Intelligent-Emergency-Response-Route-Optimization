@@ -251,18 +251,18 @@ function App() {
                         </>
                     )}
 
-                    {route.length > 0 && (
-                        <Polyline 
-                            key={`path-${currentTarget?.name}-${isGreenCorridor}`}
-                            positions={route} 
-                            pathOptions={{ 
-                                color: isGreenCorridor ? '#10b981' : theme.color, 
-                                weight: 8, 
-                                opacity: 0.8,
-                                className: isGreenCorridor ? 'neon-pulse' : '' 
-                            }} 
-                        />
-                    )}
+                    {route && route.length > 1 && route.every(coord => coord[0] && coord[1]) && (
+    <Polyline 
+        key={`path-${currentTarget?.name}-${Date.now()}`} // Force fresh render
+        positions={route} 
+        pathOptions={{ 
+            color: isGreenCorridor ? '#10b981' : theme.color, 
+            weight: 8, 
+            opacity: 0.8,
+            className: isGreenCorridor ? 'neon-pulse' : '' 
+        }} 
+    />
+)}
                 </MapContainer>
             </main>
         </div>

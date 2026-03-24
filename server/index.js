@@ -8,7 +8,7 @@ app.use(cors({ origin: '*', methods: ['GET', 'POST'] }));
 app.use(express.json());
 
 const PORT = 5000;
-const AI_URL = process.env.AI_URL || "https://routeflow-ai-engine.onrender.com";
+const AI_URL = process.env.AI_URL || "http://localhost:8000";
 
 const getClinicalPulse = (hosp, hour) => {
     let arrivalRate = 0.15; 
@@ -105,7 +105,7 @@ app.post('/dispatch', async (req, res) => {
 
     try {
         const aiResponse = await axios.post(`${AI_URL}/get_route`, {
-            city_query: city.query,
+            city_query: city.id,
             start_lat: parseFloat(user_lat), start_lng: parseFloat(user_lng),
             end_lat: parseFloat(target_lat), end_lng: parseFloat(target_lng),
             target_hour: parseInt(target_hour),
@@ -121,7 +121,8 @@ app.post('/dispatch', async (req, res) => {
             telemetry: aiResponse.data.telemetry
         });
     } catch (err) {
-        res.status(503).json({ error: "AI Engine Offline" });
+        console.error("AI engine request failed", err?.response?.data || err.message || err);
+        res.status(503).json({ error: "AI Engine Offline", details: err?.response?.data || err?.message || "unknown" });
     }
 });
 

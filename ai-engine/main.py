@@ -13,30 +13,60 @@ from fastapi.middleware.cors import CORSMiddleware
 from environment import MultiCityTrafficEnv 
 from agent import AmbulanceAgent
 
+# --- SETUP LOGGING ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AI_ENGINE")
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# --- NEURAL BRAIN LOADING ---
+# --- GLOBAL PATHS & MODELS ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_DIM, ACTION_DIM = 6, 8
 agent = AmbulanceAgent(STATE_DIM, ACTION_DIM)
-if os.path.exists("ambulance_brain.pth"):
-    # Use map_location='cpu' to ensure it works on Render's free tier
-    agent.policy_net.load_state_dict(torch.load("ambulance_brain.pth", map_location=torch.device('cpu')))
-    agent.policy_net.eval()
-    logger.info("🧠 Neural Brain Synced.")
-
-# --- LAZY LOADING REGISTRY ---
-# We keep the environments empty at startup to bypass the Render timeout.
 city_list = ["jaipur", "allahabad"]
-city_synonyms = {"prayagraj": "allahabad"}
 city_envs = {}
+
+# --- STARTUP BOOTSTRAP (Eager Loading) ---
+def bootstrap():
+    # 1. Load Neural Brain
+    brain_path = os.path.join(BASE_DIR, "ambulance_brain.pth")
+    if os.path.exists(brain_path):
+        agent.policy_net.load_state_dict(torch.load(brain_path, map_location=torch.device('cpu')))
+        agent.policy_net.eval()
+        logger.info("🧠 Neural Brain Synced.")
+
+    # 2. Load Maps into RAM immediately
+    logger.info("🦾 BOOTING SECTORS (Pre-loading maps)...")
+    for cid in city_list:
+        map_path = os.path.join(BASE_DIR, f"{cid}_map.graphml")
+        if os.path.exists(map_path):
+            try:
+                logger.info(f"📍 Loading {cid.upper()} map file ({map_path})...")
+                G = ox.load_graphml(map_path)
+                
+                # Connectivity check
+                scc = max(nx.strongly_connected_components(G), key=len) if G.is_directed() else max(nx.connected_components(G), key=len)
+                
+                env = MultiCityTrafficEnv(cid, map_path)
+                env.G = ox.project_graph(G.subgraph(scc).copy(), to_crs="EPSG:4326")
+                city_envs[cid] = env
+                logger.info(f"✅ {cid.upper()} Sector Ready.")
+            except Exception as e:
+                logger.error(f"❌ Failed to boot {cid}: {e}")
+        else:
+            logger.warning(f"⚠️ Map file {map_path} not found.")
+
+# Run the bootstrap before the app starts
+bootstrap()
 
 @app.get("/")
 async def health_check():
-    return {"status": "online", "loaded_sectors": list(city_envs.keys())}
+    return {
+        "status": "online", 
+        "loaded_sectors": list(city_envs.keys()),
+        "engine": "EagerLoad_V1"
+    }
 
 class RouteRequest(BaseModel):
     city_query: str
@@ -50,30 +80,9 @@ class RouteRequest(BaseModel):
 async def get_route(req: RouteRequest):
     raw_query = req.city_query.lower()
     target_id = next((cid for cid in city_list if cid in raw_query), None)
-    if not target_id: 
-        target_id = next((cid for syn, cid in city_synonyms.items() if syn in raw_query), None)
     
-    if not target_id:
-        raise HTTPException(status_code=400, detail="CITY_NOT_SUPPORTED")
-
-    # --- LAZY LOAD TRIGGER ---
-    # This is the "Turbo Hack". If the city isn't in memory, we load it now.
-    if target_id not in city_envs:
-        map_path = f"{target_id}_map.graphml"
-        if os.path.exists(map_path):
-            try:
-                logger.info(f"🦾 ON_DEMAND_LOAD: {target_id} (This may take a moment)...")
-                G = ox.load_graphml(map_path)
-                scc = max(nx.strongly_connected_components(G), key=len) if G.is_directed() else max(nx.connected_components(G), key=len)
-                env = MultiCityTrafficEnv(target_id, map_path)
-                env.G = ox.project_graph(G.subgraph(scc).copy(), to_crs="EPSG:4326")
-                city_envs[target_id] = env
-                logger.info(f"✅ {target_id.upper()} Sector Activated.")
-            except Exception as e:
-                logger.error(f"Lazy Load Failed for {target_id}: {e}")
-                raise HTTPException(status_code=500, detail="MAP_LOAD_FAILURE")
-        else:
-            raise HTTPException(status_code=404, detail="MAP_FILE_MISSING")
+    if not target_id or target_id not in city_envs:
+        raise HTTPException(status_code=400, detail="CITY_NOT_LOADED")
 
     env = city_envs[target_id]
 
@@ -104,7 +113,7 @@ async def get_route(req: RouteRequest):
             if req.is_green_corridor:
                 traffic_mult = 0.2 if road_type in priority_roads else 0.8
             else:
-                penalty_weight = 60.0 # Optimized for smaller cities
+                penalty_weight = 60.0 
                 traffic_mult = 1.0 + (rush_intensity * penalty_weight if road_type in priority_roads else rush_intensity * 8.0)
             
             data['ml_cost'] = length * traffic_mult * ai_friction
@@ -148,6 +157,5 @@ async def get_route(req: RouteRequest):
         raise HTTPException(status_code=500, detail="PATHFINDING_ERROR")
 
 if __name__ == "__main__":
-    # Render uses the $PORT environment variable
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
